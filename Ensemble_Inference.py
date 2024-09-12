@@ -1,104 +1,92 @@
-import h5py
 import pandas as pd
 import numpy as np
 import rdkit as rd
 import seaborn as sns
 import matplotlib.pyplot as plt
-import xgboost as xgb
+import joblib
+import os
+import sys
 
 from rdkit import Chem, DataStructs
 from rdkit.Chem import rdchem, Descriptors, rdMolDescriptors, AllChem, rdFingerprintGenerator
 from rdkit.Chem import rdFingerprintGenerator as fpg
 
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, OneHotEncoder
-from sklearn.decomposition import PCA
-from scipy.spatial.distance import euclidean, pdist
-from sklearn.metrics import pairwise_distances_argmin_min
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold, GridSearchCV
-from sklearn.metrics import roc_auc_score, accuracy_score, classification_report, brier_score_loss, confusion_matrix 
-from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split, cross_val_score, RandomizedSearchCV, StratifiedKFold, GridSearchCV
+from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score, classification_report, brier_score_loss, confusion_matrix 
 
-SMILES_df = pd.read_csv('DILIST_SMILES.csv')
-ZINC_df = pd.read_csv('ZINC20_qed_0.5.csv')
+from xgboost import XGBClassifier
 
-# Function to generate the bitvectors as Tanimoto's similarity requires bit vectors as input.
-# Run this code everytime the file is loaded again
-def generate_bitvector(smiles):
-    molecule = Chem.MolFromSmiles(smiles)
-    circular_bit_fp = fpg.GetMorganGenerator(radius=2).GetFingerprint(molecule)
-    return circular_bit_fp
+X_ecfp = np.array(df_01['ECFP_BitVect'].tolist())
+X_tpsa = df_01['TPSA'].values.reshape(-1, 1)
+X_logp = df_01['LogP'].values.reshape(-1, 1)
+X_combined = np.hstack([X_ecfp, X_tpsa, X_logp])
 
-# Apply the function to generate the bit vector for each molecule in your DataFrames
-ZINC_df['ECFP_BitVect'] = ZINC_df['Canonical_SMILES'].apply(generate_bitvector)
-SMILES_df['ECFP_BitVect'] = SMILES_df['Canonical_SMILES'].apply(generate_bitvector)
+y = df_01['DILIst_Classification']
+X_train_val, X_test, y_train_val, y_test = train_test_split(X_combined, y, test_size=0.2, random_state=42, stratify=y)
 
-# Prepare the feature matrix
-bit_matrix = np.array([list(fp.ToBitString()) for fp in SMILES_df['ECFP_BitVect']], dtype=np.int8)
-tpsa_logp_matrix = SMILES_df[['TPSA', 'LogP']].values
-combined_matrix = np.hstack([bit_matrix, tpsa_logp_matrix])
+X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.25, random_state=42, stratify=y_train_val)
 
-# Target labels (DILI annotations)
-y = SMILES_df['DILIst_Classification'].values
+scaler = StandardScaler()
+X_train_normalized = scaler.fit_transform(X_train)
+X_val_normalized = scaler.transform(X_val)
+X_test_normalized = scaler.transform(X_test)
 
-# Split data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(combined_matrix, y, test_size=0.3, random_state=42)
+f1_scores = np.array([0.77, 0.76, 0.71, 0.77])  # F1 scores for RF, SVM, LR, XGB
+roc_auc_scores = np.array([0.87, 0.84, 0.74, 0.85])  # ROC AUC scores
+balanced_acc_scores = np.array([0.81, 0.80, 0.76, 0.81])  # Balanced accuracy
+ece_scores = np.array([0.03, 0.06, 0.04, 0.05])  # Expected Calibration Error (lower is better)
 
-# Train the Random Forest model for generating tree-based embeddings
-rf_for_embedding = RandomForestClassifier(n_estimators=100, random_state=42)
-rf_for_embedding.fit(X_train, y_train)
+f1_norm = f1_scores / np.max(f1_scores)
+roc_auc_norm = roc_auc_scores / np.max(roc_auc_scores)
+balanced_acc_norm = balanced_acc_scores / np.max(balanced_acc_scores)
 
-# Get the leaf indices for each sample
-train_leaf_indices = rf_for_embedding.apply(X_train)
-test_leaf_indices = rf_for_embedding.apply(X_test)
+ece_norm = (1 - (ece_scores / np.max(ece_scores)))
 
-# One-hot encode the leaf indices
-encoder = OneHotEncoder(categories='auto')
-train_leaves = encoder.fit_transform(train_leaf_indices).toarray()  # Convert to dense array
-test_leaves = encoder.transform(test_leaf_indices).toarray()  # Convert to dense array
+aggregated_scores = (f1_norm + roc_auc_norm + balanced_acc_norm + ece_norm) / 4
 
-# Debugging output to verify shapes
-print("X_train shape:", X_train.shape)
-print("Train leaves shape:", train_leaves.shape)
+weights = aggregated_scores / np.sum(aggregated_scores)
 
-# Combine the original features with the one-hot encoded leaf indices
-X_train_combined = np.hstack([X_train, train_leaves])
-X_test_combined = np.hstack([X_test, test_leaves])
+print("Model Weights based on aggregated performance metrics:", weights)
 
-# Initialize and train the Logistic Regression model on the combined features
-log_reg_model = LogisticRegression(max_iter=1000, random_state=42)
-log_reg_model.fit(X_train_combined, y_train)
+final_results = []
 
-# Evaluate the model
-y_pred_proba = log_reg_model.predict_proba(X_test_combined)[:, 1]
-y_pred = log_reg_model.predict(X_test_combined)
+chunk_size = 10000 
+num_rows = df_02.shape[0]
 
-# Print evaluation metrics
-print(f'Accuracy: {accuracy_score(y_test, y_pred)}')
-print(f'AUC-ROC: {roc_auc_score(y_test, y_pred_proba)}')
-print(classification_report(y_test, y_pred))
+for start in range(0, num_rows, chunk_size):
+    end = min(start + chunk_size, num_rows)
+    
+    X_combined_normalized_chunk = np.load(f"{save_dir}/normalized_chunk_{start}_{end}.npy")
+    
+    rf_probs = rf_model.predict_proba(X_combined_normalized_chunk)[:, 1]
+    svm_probs = svm_model.predict_proba(X_combined_normalized_chunk)[:, 1]
+    lr_probs = lr_model.predict_proba(X_combined_normalized_chunk)[:, 1]
+    xgb_probs = xgb_model.predict_proba(X_combined_normalized_chunk)[:, 1]
 
-# Combine ECFP bit vectors with molecular descriptors from ZINC_df
-zinc_bit_matrix = np.array([list(fp.ToBitString()) for fp in ZINC_df['ECFP_BitVect']], dtype=np.int8)
-zinc_tpsa_logp_matrix = ZINC_df[['TPSA', 'LogP']].values
-zinc_combined_matrix = np.hstack([zinc_bit_matrix, zinc_tpsa_logp_matrix])
+    ensemble_probs = (weights[0] * rf_probs +
+                      weights[1] * svm_probs +
+                      weights[2] * lr_probs +
+                      weights[3] * xgb_probs)
 
-# Use the trained Random Forest model to generate tree-based embeddings for ZINC_df
-zinc_leaf_indices = rf_for_embedding.apply(zinc_combined_matrix)
+    ensemble_pred = (ensemble_probs >= 0.5).astype(int)
 
-# One-hot encode the leaf indices for ZINC_df
-zinc_leaves = encoder.transform(zinc_leaf_indices).toarray()  # Convert to dense array
+    chunk_results = pd.DataFrame({
+        'DILI_Risk_Prediction': ensemble_pred,
+        'DILI_Risk_Probability': ensemble_probs
+    })
 
-# Combine the original features with the one-hot encoded leaf indices for ZINC_df
-zinc_combined_features = np.hstack([zinc_combined_matrix, zinc_leaves])
+    final_results.append(chunk_results)
 
-# Predict the probabilities using the trained logistic regression model
-zinc_pred_proba = log_reg_model.predict_proba(zinc_combined_features)[:, 1]
+    chunk_results.to_csv(f"{result_dir}/predictions_chunk_{start}_{end}.csv", index=False)
 
-# Add the probabilities to the ZINC_df for easier analysis
-ZINC_df['Probability_Bin'] = zinc_pred_proba
+final_results_df = pd.concat(final_results, ignore_index=True)
+
+df_02['DILI_Risk_Prediction'] = final_results_df['DILI_Risk_Prediction']
+df_02['DILI_Risk_Probability'] = final_results_df['DILI_Risk_Probability']
